@@ -52,8 +52,9 @@ typedef enum {
   PORT_MIDI_IN = 0,
   PORT_GAIN,
   PORT_PANNING,
-  PORT_ATTACK_AMPLITUDE,
+  PORT_ATTACK_LEVEL,
   PORT_ATTACK_TIME,
+  PORT_SUSTAIN_LEVEL,
   PORT_DECAY_TIME,
   PORT_RELEASE_TIME,
   PORT_AUDIO_OUT_LEFT,
@@ -65,7 +66,7 @@ typedef enum {
   DECAY,
   SUSTAIN,
   RELEASE
-} EnvelopeStatus;
+} VoiceStatus;
 
 typedef struct {
   int key;
@@ -74,10 +75,14 @@ typedef struct {
   float phase_increment;
   int sample_counter;
   float attack_duration;
+  float attack_level;
   float decay_duration;
+  float sustain_level;
   float release_duration;
-  float attack_amplitude;
-  EnvelopeStatus envelope_status;
+  float envelope_level;
+  float released_envelope_level;
+
+  VoiceStatus status;
 } Voice;
 
 typedef struct {
@@ -88,13 +93,14 @@ typedef struct {
   const LV2_Atom_Sequence* control;
   const float* gain;
   const float* panning;
-  const float* attack_amplitude;
+  const float* attack_level;
   const float* attack_time;
+  const float* sustain_level;
   const float* decay_time;
   const float* release_time;
-  int attack_duration;
-  int decay_duration;
-  int release_duration;
+  float attack_duration;
+  float decay_duration;
+  float release_duration;
   float* out_left;
   float* out_right;
 
@@ -110,43 +116,50 @@ typedef struct {
 
 static float
 adsr(Voice* voice) {
-  float sustain_amplitude = 1;
+  float level;
 
-  switch(voice->envelope_status) {
+  switch(voice->status) {
   case SUSTAIN:
-    return sustain_amplitude;
+    level = voice->sustain_level;
+    break;
   case ATTACK:
     if (voice->sample_counter > voice->attack_duration) {
-      voice->envelope_status = DECAY;
+      voice->status = DECAY;
       voice->sample_counter = 0;
 
-      return voice->attack_amplitude;
+      level = voice->attack_level;
     }
     else {
-      return voice->sample_counter * (voice->attack_amplitude / voice->attack_duration);
+      level = voice->sample_counter * (voice->attack_level / voice->attack_duration);
     }
+
+    break;
   case DECAY:
     if (voice->sample_counter > voice->decay_duration) {
-      voice->envelope_status = SUSTAIN;
+      voice->status = SUSTAIN;
       voice->sample_counter = 0;
 
-      return sustain_amplitude;
+      level = voice->sustain_level;
     }
     else {
-      return ((sustain_amplitude - voice->attack_amplitude) * (voice->sample_counter/voice->decay_duration) + voice->attack_amplitude);
+      level = ((voice->sustain_level - voice->attack_level) * (voice->sample_counter/voice->decay_duration) + voice->attack_level);
     }
+    break;
   case RELEASE:
     if (voice->sample_counter > voice->release_duration) {
       voice->velocity = 0;
 
-      return 0;
+      level = 0;
     }
     else {
-      return (voice->release_duration - voice->sample_counter)/voice->release_duration;
+      level = voice->released_envelope_level * (voice->release_duration - voice->sample_counter)/voice->release_duration;
     }
+    break;
   }
 
-  return 1;
+  voice->envelope_level = level;
+
+  return level;
 }
 
 static float
@@ -158,9 +171,9 @@ tick_voice(Voice* voice) {
     voice->phase -= TWO_PI;
   }
 
-  val *= adsr(voice);
+  val *= adsr(voice);;
 
-  if (voice->envelope_status != SUSTAIN) {
+  if (voice->status != SUSTAIN) {
     voice->sample_counter++;
   }
 
@@ -213,6 +226,12 @@ note_on(ElDuderino* self, uint8_t key, uint8_t velocity) {
   Voice* voice = key_voice(self, key);
 
   if (voice != NULL) {
+    if (voice->status == RELEASE) {
+      voice->status = ATTACK;
+      voice->sample_counter = 0;
+      voice->released_envelope_level = voice->envelope_level;
+    }
+
     return;
   }
 
@@ -221,13 +240,15 @@ note_on(ElDuderino* self, uint8_t key, uint8_t velocity) {
 
     if (voice->velocity == 0) {
       float freq = MIDI_KEYS[key];
+      voice->released_envelope_level = 0;
       voice->key = key;
       voice->velocity = velocity;
       voice->phase_increment = (freq * TWO_PI) / self->sample_rate;
       voice->sample_counter = 0;
-      voice->envelope_status = ATTACK;
+      voice->status = ATTACK;
 
-      voice->attack_amplitude = *self->attack_amplitude;
+      voice->attack_level = *self->attack_level;
+      voice->sustain_level = *self->sustain_level;
       voice->attack_duration = self->attack_duration;
       voice->decay_duration = self->decay_duration;
       voice->release_duration = self->release_duration;
@@ -242,8 +263,9 @@ note_off(ElDuderino* self, uint8_t key) {
   Voice* voice = key_voice(self, key);
 
   if (voice != NULL) {
-    voice->envelope_status = RELEASE;
     voice->sample_counter = 0;
+    voice->status = RELEASE;
+    voice->released_envelope_level = voice->envelope_level;
   }
 }
 
@@ -292,11 +314,14 @@ connect_port(LV2_Handle instance,
   case PORT_PANNING:
     self->panning = (const float*)data;
     break;
-  case PORT_ATTACK_AMPLITUDE:
-    self->attack_amplitude = (const float*)data;
+  case PORT_ATTACK_LEVEL:
+    self->attack_level = (const float*)data;
     break;
   case PORT_ATTACK_TIME:
     self->attack_time = (const float*)data;
+    break;
+  case PORT_SUSTAIN_LEVEL:
+    self->sustain_level = (const float*)data;
     break;
   case PORT_DECAY_TIME:
     self->decay_time = (const float*)data;
