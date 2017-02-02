@@ -228,8 +228,7 @@ note_on(ElDuderino* self, uint8_t key, uint8_t velocity) {
   if (voice != NULL) {
     if (voice->status == RELEASE) {
       voice->status = ATTACK;
-      voice->sample_counter = 0;
-      voice->released_envelope_level = voice->envelope_level;
+      voice->sample_counter = voice->attack_duration * voice->envelope_level;
     }
 
     return;
