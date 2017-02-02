@@ -109,39 +109,44 @@ typedef struct {
 } ElDuderino;
 
 static float
-envelop_voice(Voice* voice, float in) {
+adsr(Voice* voice) {
+  float sustain_amplitude = 1;
+
   switch(voice->envelope_status) {
   case SUSTAIN:
-    break;
+    return sustain_amplitude;
   case ATTACK:
     if (voice->sample_counter > voice->attack_duration) {
       voice->envelope_status = DECAY;
       voice->sample_counter = 0;
+
+      return voice->attack_amplitude;
     }
     else {
-      return in * voice->sample_counter * (voice->attack_amplitude / voice->attack_duration);
+      return voice->sample_counter * (voice->attack_amplitude / voice->attack_duration);
     }
-    break;
   case DECAY:
     if (voice->sample_counter > voice->decay_duration) {
       voice->envelope_status = SUSTAIN;
       voice->sample_counter = 0;
+
+      return sustain_amplitude;
     }
     else {
-      return in * ((1 - voice->attack_amplitude) * (voice->sample_counter/voice->decay_duration) + voice->attack_amplitude);
+      return ((sustain_amplitude - voice->attack_amplitude) * (voice->sample_counter/voice->decay_duration) + voice->attack_amplitude);
     }
-    break;
   case RELEASE:
     if (voice->sample_counter > voice->release_duration) {
       voice->velocity = 0;
+
+      return 0;
     }
     else {
-      return in * (voice->release_duration - voice->sample_counter)/voice->release_duration;
+      return (voice->release_duration - voice->sample_counter)/voice->release_duration;
     }
-    break;
   }
 
-  return in;
+  return 1;
 }
 
 static float
@@ -153,13 +158,13 @@ tick_voice(Voice* voice) {
     voice->phase -= TWO_PI;
   }
 
-  float out = envelop_voice(voice, val);
+  val *= adsr(voice);
 
   if (voice->envelope_status != SUSTAIN) {
     voice->sample_counter++;
   }
 
-  return out;
+  return val;
 }
 
 static void
