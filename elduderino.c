@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdint.h>
 
 #include "elduderino.h"
 
@@ -51,28 +52,49 @@ typedef enum {
   PORT_MIDI_IN = 0,
   PORT_GAIN,
   PORT_PANNING,
+  PORT_ATTACK_AMPLITUDE,
+  PORT_ATTACK_TIME,
+  PORT_DECAY_TIME,
+  PORT_RELEASE_TIME,
   PORT_AUDIO_OUT_LEFT,
   PORT_AUDIO_OUT_RIGHT
 } PortIndex;
+
+typedef enum {
+  ATTACK = 0,
+  DECAY,
+  SUSTAIN,
+  RELEASE
+} EnvelopeStatus;
 
 typedef struct {
   int key;
   int velocity;
   float phase;
   float phase_increment;
+  int sample_counter;
+  float attack_duration;
+  float decay_duration;
+  float release_duration;
+  float attack_amplitude;
+  EnvelopeStatus envelope_status;
 } Voice;
 
 typedef struct {
   // necessary to generate a sin wave of the correct frequency
   double sample_rate;
   
-  // used internally to keep track of where we are in the wave
-  float phase;
-  
   // port buffers
   const LV2_Atom_Sequence* control;
   const float* gain;
   const float* panning;
+  const float* attack_amplitude;
+  const float* attack_time;
+  const float* decay_time;
+  const float* release_time;
+  int attack_duration;
+  int decay_duration;
+  int release_duration;
   float* out_left;
   float* out_right;
 
@@ -87,6 +109,42 @@ typedef struct {
 } ElDuderino;
 
 static float
+envelop_voice(Voice* voice, float in) {
+  switch(voice->envelope_status) {
+  case SUSTAIN:
+    break;
+  case ATTACK:
+    if (voice->sample_counter > voice->attack_duration) {
+      voice->envelope_status = DECAY;
+      voice->sample_counter = 0;
+    }
+    else {
+      return in * voice->sample_counter * (voice->attack_amplitude / voice->attack_duration);
+    }
+    break;
+  case DECAY:
+    if (voice->sample_counter > voice->decay_duration) {
+      voice->envelope_status = SUSTAIN;
+      voice->sample_counter = 0;
+    }
+    else {
+      return in * ((1 - voice->attack_amplitude) * (voice->sample_counter/voice->decay_duration) + voice->attack_amplitude);
+    }
+    break;
+  case RELEASE:
+    if (voice->sample_counter > voice->release_duration) {
+      voice->velocity = 0;
+    }
+    else {
+      return in * (voice->release_duration - voice->sample_counter)/voice->release_duration;
+    }
+    break;
+  }
+
+  return in;
+}
+
+static float
 tick_voice(Voice* voice) {
   float val = sin(voice->phase);
 
@@ -95,7 +153,13 @@ tick_voice(Voice* voice) {
     voice->phase -= TWO_PI;
   }
 
-  return val;
+  float out = envelop_voice(voice, val);
+
+  if (voice->envelope_status != SUSTAIN) {
+    voice->sample_counter++;
+  }
+
+  return out;
 }
 
 static void
@@ -104,9 +168,8 @@ render_samples(uint32_t from, uint32_t to, ElDuderino* self) {
   float* const out_right = self->out_right;
 
   float gain = DB_CO(*(self->gain));
-  float panning = (*(self->panning));
-  float angle = panning * PIOVR2 * 0.5;
 
+  float angle = (*(self->panning)) * PIOVR2 * 0.5;
   float pan_left  = ROOT2OVR2 * (cos(angle) - sin(angle));
   float pan_right = ROOT2OVR2 * (cos(angle) + sin(angle));
 
@@ -127,8 +190,27 @@ render_samples(uint32_t from, uint32_t to, ElDuderino* self) {
   }
 }
 
+static Voice*
+key_voice(ElDuderino* self, uint8_t key) {
+  for (int i_voice = 0; i_voice < N_VOICES; i_voice++) {
+    Voice* voice = self->voices[i_voice];
+
+    if (voice->key == key && voice->velocity > 0) {
+      return voice;
+    }
+  }
+
+  return NULL;
+}
+
 static void
-spawn_voice(ElDuderino* self, uint8_t key, uint8_t velocity) {
+note_on(ElDuderino* self, uint8_t key, uint8_t velocity) {
+  Voice* voice = key_voice(self, key);
+
+  if (voice != NULL) {
+    return;
+  }
+
   for (int i_voice = 0; i_voice < N_VOICES; i_voice++) {
     Voice* voice = self->voices[i_voice];
 
@@ -137,21 +219,26 @@ spawn_voice(ElDuderino* self, uint8_t key, uint8_t velocity) {
       voice->key = key;
       voice->velocity = velocity;
       voice->phase_increment = (freq * TWO_PI) / self->sample_rate;
+      voice->sample_counter = 0;
+      voice->envelope_status = ATTACK;
 
-      return;
+      voice->attack_amplitude = *self->attack_amplitude;
+      voice->attack_duration = self->attack_duration;
+      voice->decay_duration = self->decay_duration;
+      voice->release_duration = self->release_duration;
+
+      break;
     }
   }
 }
 
 static void
-kill_voice(ElDuderino* self, uint8_t key) {
-  for (int i_voice = 0; i_voice < N_VOICES; i_voice++) {
-    Voice* voice = self->voices[i_voice];
+note_off(ElDuderino* self, uint8_t key) {
+  Voice* voice = key_voice(self, key);
 
-    if (voice->key == key) {
-      voice->velocity = 0;
-      return;
-    }
+  if (voice != NULL) {
+    voice->envelope_status = RELEASE;
+    voice->sample_counter = 0;
   }
 }
 
@@ -200,6 +287,18 @@ connect_port(LV2_Handle instance,
   case PORT_PANNING:
     self->panning = (const float*)data;
     break;
+  case PORT_ATTACK_AMPLITUDE:
+    self->attack_amplitude = (const float*)data;
+    break;
+  case PORT_ATTACK_TIME:
+    self->attack_time = (const float*)data;
+    break;
+  case PORT_DECAY_TIME:
+    self->decay_time = (const float*)data;
+    break;
+  case PORT_RELEASE_TIME:
+    self->release_time = (const float*)data;
+    break;
   case PORT_AUDIO_OUT_LEFT:
     self->out_left  = (float*)data;
     break;
@@ -224,9 +323,24 @@ activate(LV2_Handle instance)
 }
 
 static void
+recalculate_params(ElDuderino* self) {
+  if (self->attack_time != NULL) {
+    self->attack_duration = self->sample_rate * (*self->attack_time) / 1000;
+  }
+  if (self->decay_time != NULL) {
+    self->decay_duration = self->sample_rate * (*self->decay_time) / 1000;
+  }
+  if (self->release_time != NULL) {
+    self->release_duration = self->sample_rate * (*self->release_time) / 1000;
+  }
+}
+
+static void
 run(LV2_Handle instance, uint32_t n_samples)
 {
   ElDuderino* self = (ElDuderino*)instance;
+
+  recalculate_params(self);
 
   uint32_t samples_done = 0;
 
@@ -239,14 +353,14 @@ run(LV2_Handle instance, uint32_t n_samples)
           render_samples(samples_done, ev->time.frames, self);
           samples_done = ev->time.frames;
 
-          spawn_voice(self, msg[1], msg[2]);
+          note_on(self, msg[1], msg[2]);
 
           break;
         case LV2_MIDI_MSG_NOTE_OFF:
           render_samples(samples_done, ev->time.frames, self);
           samples_done = ev->time.frames;
 
-          kill_voice(self, msg[1]);
+          note_off(self, msg[1]);
 
           break;
         default: break;
